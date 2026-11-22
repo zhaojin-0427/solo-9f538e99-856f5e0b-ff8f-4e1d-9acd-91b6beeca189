@@ -279,27 +279,39 @@ def _encode_candidates(
     lower: int,
     upper: int,
     eps: int,
+    byte_limit: int,
     *,
     allow_deflate_raw: bool = True,
 ):
     """Yield (size, codec, blob) for one sample series, cheap codecs first.
 
-    ``deflate-int32`` is the most expensive encoder and only wins on data whose
-    deltas are unhelpful, so callers may turn it off for very long series.
-    A codec that cannot represent this data (for example a raw int32 stream
-    with an out-of-range endpoint) is skipped rather than failing the request.
-    The generator stops as soon as the caller breaks.
+    All five V1 codecs are evaluated so the caller can pick the smallest
+    package that fits; sizes include the 48-byte header.  ``deflate-int32``
+    is stream-encoded with its output capped at what *byte_limit* can still
+    hold, so even very long series are tried with memory bounded by a fixed
+    processing buffer plus the in-limit compressed output; the candidate is
+    skipped as soon as it outgrows the budget.  ``allow_deflate_raw=False``
+    keeps that most expensive encoder out of the budgeted fallback search
+    over very long series.  A codec that cannot represent this data (for
+    example a raw int32 stream with an out-of-range endpoint) is skipped
+    rather than failing the request.  The generator stops as soon as the
+    caller breaks.
     """
-    n = len(data)
-    order = [pack.CODEC_DELTA_VARINT, pack.CODEC_DELTA2_VARINT]
-    if n <= 4096:
-        order.append(pack.CODEC_RAW)
-    order.append(pack.CODEC_DEFLATE_DELTA)
+    order = [
+        pack.CODEC_DELTA_VARINT,
+        pack.CODEC_DELTA2_VARINT,
+        pack.CODEC_RAW,
+        pack.CODEC_DEFLATE_DELTA,
+    ]
     if allow_deflate_raw:
         order.append(pack.CODEC_DEFLATE_RAW)
+    payload_cap = max(0, byte_limit - pack.HEADER_SIZE)
     for codec in order:
         try:
-            payload = pack.encode_payload(codec, data)
+            if codec == pack.CODEC_DEFLATE_RAW:
+                payload = pack.deflate_int32_payload(data, payload_cap)
+            else:
+                payload = pack.encode_payload(codec, data)
             blob = pack.build_package(
                 codec, flags, data, payload, lower, upper, eps
             )
@@ -328,7 +340,8 @@ def _best_under(
     best = None
     floor = None
     for size, _codec, blob in _encode_candidates(
-        data, flags, lower, upper, eps, allow_deflate_raw=allow_deflate_raw
+        data, flags, lower, upper, eps, byte_limit,
+        allow_deflate_raw=allow_deflate_raw,
     ):
         floor = size if floor is None else min(floor, size)
         if size <= byte_limit and (best is None or size < len(best)):
@@ -353,24 +366,24 @@ def deliver(
 ) -> Delivery:
     """Produce a verified package within *byte_limit*.
 
-    Lossless encodings are tried first and the smallest wins.  Only when none
-    fit does the bounded-error fallback run: candidates go from coarsest (most
-    compressible) to finest, and the first one that yields a package at or
-    under the limit is verified and returned.  If nothing fits, no bytes are
-    delivered and :class:`PackageTooLarge` is raised.
+    All five lossless V1 encodings are tried first — the 48-byte header
+    included in the size — and the smallest package that fits wins.  Only
+    when no lossless package fits does the bounded-error fallback run:
+    candidates go from coarsest (most compressible) to finest, and the
+    first one that yields a package at or under the limit is verified and
+    returned.  If nothing fits, no bytes are delivered and
+    :class:`PackageTooLarge` is raised.
     """
     n = len(values)
-    # Long series cannot afford the exhaustive search; the coarse candidates
-    # that matter most are still all tried and the clock bounds the rest.
-    allow_deflate_raw = n <= 200_000
 
-    # Fast path: lossless fits.  This pass is linear in the sample count and
-    # is always allowed to finish; only the fallback search is budgeted.
-    lossless, floor = _best_under(
-        values, 0, lower, upper, eps, 10**18,
-        allow_deflate_raw=allow_deflate_raw,
-    )
-    if len(lossless) <= byte_limit:
+    # Fast path: a lossless package fits.  Every V1 codec is evaluated
+    # regardless of series length; the deflate-int32 candidate is
+    # stream-encoded against the remaining budget, so its extra memory is
+    # bounded by a fixed processing buffer and the in-limit compressed
+    # output.  This pass is linear in the sample count and is always
+    # allowed to finish; only the fallback search is budgeted.
+    lossless, floor = _best_under(values, 0, lower, upper, eps, byte_limit)
+    if lossless is not None:
         summary = verify_package(lossless, values, lower, upper, eps)
         return Delivery(
             package=lossless,
@@ -383,6 +396,9 @@ def deliver(
 
     # Bounded-error fallback, coarsest admissible approximation first.  Each
     # candidate keeps every sample inside its own +/- eps and verdict band.
+    # Long series cannot afford deflate-int32 in every candidate; the clock
+    # bounds the rest.
+    allow_deflate_raw = n <= 200_000
     deadline = time.monotonic() + APPROX_TIME_BUDGET
     timed_out = False
     for candidate in _approximation_candidates(values, lower, upper, eps):

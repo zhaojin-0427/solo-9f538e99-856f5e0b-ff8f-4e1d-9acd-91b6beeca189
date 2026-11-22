@@ -63,6 +63,17 @@ class PackageTooLarge(PackError):
     """The smallest acceptable package still exceeds the byte budget."""
 
 
+class PayloadTooLarge(PackError):
+    """A capped payload encode exceeded its byte budget before finishing."""
+
+
+# Fixed-size processing buffer for the streaming deflate-int32 encoder: the
+# int32 stream is fed to the compressor in chunks of at most this many bytes,
+# so building the candidate never materialises the whole 4-bytes-per-sample
+# stream next to its compressed copy.
+DEFLATE_STREAM_CHUNK = 64 * 1024
+
+
 def verdict(value: int, lower: int, upper: int) -> str:
     """Classify a single reading.  The accepted interval is inclusive."""
     if value < lower:
@@ -135,13 +146,45 @@ def _delta_stream(values: Sequence[int], second_order: bool) -> bytes:
     return bytes(out)
 
 
+def deflate_int32_payload(
+    values: Sequence[int], max_payload_bytes: int | None = None
+) -> bytes:
+    """deflate over the little-endian int32 stream, with an optional cap.
+
+    The stream is fed to the compressor in fixed-size chunks, so the extra
+    memory stays bounded by that processing buffer plus at most
+    *max_payload_bytes* of compressed output (plus one in-flight chunk).
+    As soon as the compressed output would exceed *max_payload_bytes* the
+    encode aborts with :class:`PayloadTooLarge`, instead of materialising a
+    payload the caller already knows cannot fit.  With ``max_payload_bytes``
+    set to ``None`` the result is byte-identical to ``zlib.compress`` over
+    the whole stream.
+    """
+    compressor = zlib.compressobj(9)
+    out = bytearray()
+    per_chunk = max(1, DEFLATE_STREAM_CHUNK // 4)
+    for start in range(0, len(values), per_chunk):
+        chunk = values[start:start + per_chunk]
+        out += compressor.compress(struct.pack(f"<{len(chunk)}i", *chunk))
+        if max_payload_bytes is not None and len(out) > max_payload_bytes:
+            raise PayloadTooLarge(
+                f"deflate-int32 payload exceeds {max_payload_bytes} bytes"
+            )
+    out += compressor.flush()
+    if max_payload_bytes is not None and len(out) > max_payload_bytes:
+        raise PayloadTooLarge(
+            f"deflate-int32 payload exceeds {max_payload_bytes} bytes"
+        )
+    return bytes(out)
+
+
 def encode_payload(codec: int, values: Sequence[int]) -> bytes:
     if codec == CODEC_RAW:
         return struct.pack(f"<{len(values)}i", *values)
     if codec == CODEC_DELTA_VARINT:
         return _delta_stream(values, second_order=False)
     if codec == CODEC_DEFLATE_RAW:
-        return zlib.compress(struct.pack(f"<{len(values)}i", *values), 9)
+        return deflate_int32_payload(values)
     if codec == CODEC_DEFLATE_DELTA:
         return zlib.compress(_delta_stream(values, second_order=False), 9)
     if codec == CODEC_DELTA2_VARINT:

@@ -1,6 +1,8 @@
 import csv
 import io
+import struct
 import unittest
+import zlib
 
 from app import pack, transfer
 
@@ -46,6 +48,43 @@ class RoundTripTests(unittest.TestCase):
 
 
 HEADER_PAYLOAD_BYTE = pack.HEADER_SIZE
+
+
+class DeflateInt32StreamTests(unittest.TestCase):
+    def test_uncapped_matches_one_shot_zlib(self):
+        values = [(i % 256) * 2**23 - 2**30 for i in range(10_000)]
+        expected = zlib.compress(
+            struct.pack(f"<{len(values)}i", *values), 9
+        )
+        self.assertEqual(pack.deflate_int32_payload(values), expected)
+        self.assertEqual(
+            pack.encode_payload(pack.CODEC_DEFLATE_RAW, values), expected
+        )
+
+    def test_empty_and_tiny_inputs(self):
+        self.assertEqual(pack.deflate_int32_payload([]), zlib.compress(b"", 9))
+        self.assertEqual(
+            pack.deflate_int32_payload([5]),
+            zlib.compress(struct.pack("<i", 5), 9),
+        )
+
+    def test_cap_boundary(self):
+        values = list(range(10_000))
+        payload = pack.deflate_int32_payload(values)
+        self.assertEqual(
+            pack.deflate_int32_payload(values, len(payload)), payload
+        )
+        with self.assertRaises(pack.PayloadTooLarge):
+            pack.deflate_int32_payload(values, len(payload) - 1)
+
+    def test_cap_aborts_without_full_output(self):
+        # Incompressible data: the compressed stream outgrows the cap long
+        # before the 4 MB source stream is consumed.
+        import random
+        rng = random.Random(9)
+        values = [rng.randint(-2**31, 2**31 - 1) for _ in range(1_000_000)]
+        with self.assertRaises(pack.PayloadTooLarge):
+            pack.deflate_int32_payload(values, 1024)
 
 
 class CsvTests(unittest.TestCase):
@@ -133,6 +172,49 @@ class DeliveryTests(unittest.TestCase):
         values = list(range(1000))
         with self.assertRaises(pack.PackageTooLarge):
             transfer.deliver(values, 0, 2000, 0, pack.HEADER_SIZE - 1)
+
+    def test_large_series_deflate_int32_lossless(self):
+        # n > 200_000: values from a 256-value alphabet spread over the int32
+        # range.  Only deflate-int32 fits the budget; the lossless pass must
+        # find it instead of reporting 413 or approximating.
+        import random
+        rng = random.Random(2026)
+        alphabet = [rng.randint(-2**31, 2**31 - 1) for _ in range(256)]
+        values = [alphabet[rng.randrange(256)] for _ in range(250_000)]
+        fitting = len(pack.encode_payload(pack.CODEC_DEFLATE_RAW, values))
+        byte_limit = fitting + pack.HEADER_SIZE
+        for codec in (pack.CODEC_RAW, pack.CODEC_DELTA_VARINT,
+                      pack.CODEC_DEFLATE_DELTA, pack.CODEC_DELTA2_VARINT):
+            self.assertGreater(
+                len(pack.encode_payload(codec, values)) + pack.HEADER_SIZE,
+                byte_limit,
+                pack.CODEC_NAMES[codec],
+            )
+        for eps in (0, 2_000_000):
+            delivery = transfer.deliver(
+                values, -2**31, 2**31 - 1, eps, byte_limit
+            )
+            self.assertFalse(delivery.approximated)
+            self.assertEqual(delivery.max_error, 0)
+            self.assertEqual(delivery.codec, "deflate-int32")
+            self.assertLessEqual(len(delivery.package), byte_limit)
+            self.assertEqual(
+                pack.decode_package(delivery.package)["values"], values
+            )
+
+    def test_large_series_raw_int32_lossless(self):
+        # Incompressible data with the limit exactly at 4n + header: only
+        # raw-int32 fits, and it must be tried for n > 4096 as well.
+        import random
+        rng = random.Random(7)
+        values = [rng.randint(-2**31, 2**31 - 1) for _ in range(50_000)]
+        byte_limit = 4 * len(values) + pack.HEADER_SIZE
+        delivery = transfer.deliver(values, -2**31, 2**31 - 1, 0, byte_limit)
+        self.assertFalse(delivery.approximated)
+        self.assertEqual(delivery.codec, "raw-int32")
+        self.assertEqual(len(delivery.package), byte_limit)
+        with self.assertRaises(pack.PackageTooLarge):
+            transfer.deliver(values, -2**31, 2**31 - 1, 0, byte_limit - 1)
 
 
 if __name__ == "__main__":

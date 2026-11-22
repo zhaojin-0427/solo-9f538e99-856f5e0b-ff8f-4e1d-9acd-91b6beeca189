@@ -119,6 +119,43 @@ def test_impossible_budget_reports_failure():
     assert "detail" in response.json()
 
 
+def test_large_csv_lossless_deflate_int32_via_api():
+    # n > 200_000 samples from a 256-value alphabet spread over the int32
+    # range: only deflate-int32 fits the budget.  The service must deliver
+    # the lossless package, not a 413 or an approximation.
+    import random
+    rng = random.Random(2026)
+    alphabet = [rng.randint(-2**31, 2**31 - 1) for _ in range(256)]
+    values = [alphabet[rng.randrange(256)] for _ in range(210_000)]
+    byte_limit = 500_000
+
+    response = upload(values, lower=-2**31, upper=2**31 - 1, eps=0,
+                      byte_limit=byte_limit)
+    assert response.status_code == 200
+    assert response.headers["x-package-approximated"] == "false"
+    assert response.headers["x-package-codec"] == "deflate-int32"
+    assert response.headers["x-package-verified"] == "true"
+    assert len(response.content) <= byte_limit
+    assert pack.decode_package(response.content)["values"] == values
+
+    report = client.post(
+        "/api/inspect",
+        files={
+            "file": ("pkg.tgp", response.content, "application/octet-stream"),
+            "original": (
+                "gauge.csv",
+                ("\n".join(map(str, values)) + "\n").encode(),
+                "text/csv",
+            ),
+        },
+    )
+    assert report.status_code == 200
+    body = report.json()
+    assert body["checked_against_original"] is True
+    assert body["approximated"] is False
+    assert body["max_error"] == 0
+
+
 def test_bad_inputs():
     values = [1, 2, 3]
     assert upload(values, lower=10, upper=0).status_code == 400
